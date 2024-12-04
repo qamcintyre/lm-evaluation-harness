@@ -5,6 +5,7 @@ from . import (
     gguf,
     hf_vlms,
     huggingface,
+    moe_zedong_hf,
     ibm_watsonx_ai,
     mamba_lm,
     nemo_lm,
