@@ -2,7 +2,7 @@ import copy
 import os
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union, Set
 
 import jinja2
 import torch
@@ -37,6 +37,7 @@ from lm_eval.models.utils import (
     stop_sequences_criteria,
 )
 
+import ast
 
 eval_logger = utils.eval_logger
 
@@ -56,7 +57,7 @@ class MOEHFLM(TemplateLM):
     def __init__(
         self,
         pretrained: Union[str, transformers.PreTrainedModel],
-        expert_masks: Optional[Dict[str, List[bool]]] = None,  # Add expert_masks parameter
+        expert_masks: Optional[Union[Dict[str, Set[int]], str]] = None,
         backend: Literal["default", "causal", "seq2seq"] = "default",
         # override whether the model should be treated as decoder-only (causal) or encoder-decoder (seq2seq)
         revision: Optional[str] = "main",
@@ -92,6 +93,26 @@ class MOEHFLM(TemplateLM):
         gptqmodel: Optional[bool] = False,
         **kwargs,
     ) -> None:
+        if isinstance(expert_masks, str):
+            expert_masks = expert_masks.strip('"\'')
+            # Split layer names by |
+            layer_expert_pairs = expert_masks.split('|')
+            expert_masks = {}
+            for pair in layer_expert_pairs:
+                if not pair:
+                    continue
+                # Extract layer name and expert indices, handling quotes
+                pair = pair.strip('\'\"')  # Remove any quotes
+                if '{' not in pair:
+                    continue
+                layer_name, expert_indices = pair.split('{', 1)
+                layer_name = layer_name.strip('\'\"')  # Remove any quotes from layer name
+                # Clean up the expert indices string and convert to set
+                expert_indices = expert_indices.rstrip('}')
+                # Split expert indices by + and convert each to int, handling any whitespace
+                expert_indices = {int(idx.strip()) for idx in expert_indices.split('+') if idx.strip()}
+                expert_masks[layer_name] = expert_indices
+        
         super().__init__()
         self.expert_masks = expert_masks or {}
         
@@ -295,33 +316,37 @@ class MOEHFLM(TemplateLM):
             self._apply_expert_masks()
 
     def _apply_expert_masks(self):
-        """Apply masks to experts in MoE layers"""
+        """Apply masks to experts in MoE layers using indices"""
         for name, module in self.model.named_modules():
             # Check if this is an MoE layer that needs masking
             if name in self.expert_masks:
-                if hasattr(module, "experts"):
-                    # Get the mask for this layer
-                    mask = self.expert_masks[name]
-                    mask = torch.tensor(mask, device=self.device)
+                if hasattr(module, 'experts'):
+                    # Get the indices to mask for this layer
+                    indices_to_mask = self.expert_masks[name]
+                    # Create boolean mask (True = keep expert, False = mask expert)
+                    mask = torch.ones(len(module.experts), device=self.device, dtype=torch.bool)
+                    # Convert indices_to_mask to list to handle both single integers and sets
+                    mask[list(indices_to_mask)] = False
                     
                     # Store original forward method
-                    if not hasattr(module, "_original_forward"):
+                    if not hasattr(module, '_original_forward'):
                         module._original_forward = module.forward
                     
-                    # Create masked forward method
-                    def masked_forward(self, *args, **kwargs):
+                    def masked_forward(self, hidden_states, *args, **kwargs):
                         # Get expert outputs from original forward
-                        expert_outputs = self._original_forward(*args, **kwargs)
+                        expert_outputs = self._original_forward(hidden_states, *args, **kwargs)
                         
-                        # Apply mask to expert outputs
+                        # Apply mask to expert outputs while preserving dimensions
                         if isinstance(expert_outputs, tuple):
-                            # Handle case where forward returns multiple values
                             expert_output = expert_outputs[0]
-                            masked_output = expert_output * mask.view(1, -1, 1, 1)
+                            # Reshape mask to match expert output dimensions
+                            expanded_mask = mask.view(-1, 1, 1).expand(-1, expert_output.size(1), expert_output.size(2))
+                            masked_output = expert_output * expanded_mask
                             return (masked_output,) + expert_outputs[1:]
                         else:
-                            # Single tensor output case
-                            return expert_outputs * mask.view(1, -1, 1, 1)
+                            # Reshape mask to match expert output dimensions
+                            expanded_mask = mask.view(-1, 1, 1).expand(-1, expert_outputs.size(1), expert_outputs.size(2))
+                            return expert_outputs * expanded_mask
                     
                     # Bind masked forward method to module
                     import types
