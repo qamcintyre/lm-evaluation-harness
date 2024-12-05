@@ -315,42 +315,53 @@ class MOEHFLM(TemplateLM):
         if isinstance(self.model, torch.nn.Module) and self.expert_masks:
             self._apply_expert_masks()
 
-    def _apply_expert_masks(self):
-        """Apply masks to experts in MoE layers using indices"""
-        for name, module in self.model.named_modules():
-            # Check if this is an MoE layer that needs masking
-            if name in self.expert_masks:
-                if hasattr(module, 'experts'):
-                    # Get the indices to mask for this layer
-                    indices_to_mask = self.expert_masks[name]
-                    # Create boolean mask (True = keep expert, False = mask expert)
-                    mask = torch.ones(len(module.experts), device=self.device, dtype=torch.bool)
-                    # Convert indices_to_mask to list to handle both single integers and sets
-                    mask[list(indices_to_mask)] = False
-                    
-                    # Store original forward method
-                    if not hasattr(module, '_original_forward'):
-                        module._original_forward = module.forward
-                    
-                    def masked_forward(self, hidden_states, *args, **kwargs):
-                        # Get expert outputs from original forward
-                        expert_outputs = self._original_forward(hidden_states, *args, **kwargs)
+    # def _apply_expert_masks(self):
+    #     """Apply masks to experts in MoE layers by setting gate weights to -inf for masked experts"""
+    #     for name, module in self.model.named_modules():
+    #         # Extract layer number from the module name for matching
+    #         if 'layers.' in name and '.mlp' in name:
+    #             layer_num = name.split('layers.')[1].split('.')[0]
+    #             layer_key = f'model.layers.{layer_num}.mlp'
+                
+    #             # Check if this layer should be masked
+    #             if layer_key in self.expert_masks.keys():
+    #                 if hasattr(module, 'gate'):
+    #                     # Get the indices to mask for this layer
+    #                     indices_to_mask = self.expert_masks[layer_key]
                         
-                        # Apply mask to expert outputs while preserving dimensions
-                        if isinstance(expert_outputs, tuple):
-                            expert_output = expert_outputs[0]
-                            # Reshape mask to match expert output dimensions
-                            expanded_mask = mask.view(-1, 1, 1).expand(-1, expert_output.size(1), expert_output.size(2))
-                            masked_output = expert_output * expanded_mask
-                            return (masked_output,) + expert_outputs[1:]
-                        else:
-                            # Reshape mask to match expert output dimensions
-                            expanded_mask = mask.view(-1, 1, 1).expand(-1, expert_outputs.size(1), expert_outputs.size(2))
-                            return expert_outputs * expanded_mask
-                    
-                    # Bind masked forward method to module
-                    import types
-                    module.forward = types.MethodType(masked_forward, module)
+    #                     # Get gate/router weights - shape is (num_experts, input_dim)
+    #                     gate_weights = module.gate.weight  # shape: [64, 2048]
+                        
+    #                     # Set rows corresponding to masked experts to -inf
+    #                     # This ensures these experts will never be selected during routing
+    #                     LARGE_NEGATIVE = -1e3
+    #                     gate_weights.data[list(indices_to_mask)] = LARGE_NEGATIVE
+                        
+    #                     #eval_logger.info(f"Applied expert mask to {layer_key}, masked experts: {indices_to_mask}")
+
+    def _apply_expert_masks(self):
+        """Apply masks to experts in MoE layers by setting gate logits to a large negative value for masked experts"""
+        for name, module in self.model.named_modules():
+            # Extract layer number from the module name for matching
+            if 'layers.' in name and '.mlp' in name:
+                layer_num = name.split('layers.')[1].split('.')[0]
+                layer_key = f'model.layers.{layer_num}.mlp'
+                
+                # Check if this layer should be masked
+                if layer_key in self.expert_masks.keys():
+                    if hasattr(module, 'gate'):
+                        indices_to_mask = self.expert_masks[layer_key]
+                        
+                        # Define the hook function inside a closure
+                        def gate_forward_hook(indices):
+                            def hook(module, input, output):
+                                LARGE_NEGATIVE = -10000
+                                output[:, list(indices)] = LARGE_NEGATIVE
+                                return output
+                            return hook
+                        
+                        # Register the hook with the specific indices
+                        module.gate.register_forward_hook(gate_forward_hook(indices_to_mask))
 
     def _get_accelerate_args(
         self,
@@ -908,7 +919,6 @@ class MOEHFLM(TemplateLM):
             A torch tensor of shape [batch, sequence, vocab] with the
         logits returned from the model's decoder
         """
-        # Ensure masks are applied before each forward pass
         if self.expert_masks:
             self._apply_expert_masks()
             
