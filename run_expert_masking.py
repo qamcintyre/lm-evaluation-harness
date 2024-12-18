@@ -19,7 +19,7 @@ cmd = [
     "python", "-m", "lm_eval",
     "--model", "moe-zedong-hf",
     "--model_args", model_args,
-    "--tasks", "mmlu_virology",
+    "--tasks", "mmlu_virology, mmlu_abstract_algebra",
     "--device", "cuda"
 ]
 
